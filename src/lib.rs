@@ -28,6 +28,7 @@ pub enum PolicyType {
     CacheAware,
     PowerOfTwo,
     ConsistentHash,
+    StickyLeastLoaded,
 }
 
 #[pyclass]
@@ -144,6 +145,7 @@ impl Router {
                 PolicyType::ConsistentHash => ConfigPolicyConfig::ConsistentHash {
                     virtual_nodes: 160, // Default value
                 },
+                PolicyType::StickyLeastLoaded => ConfigPolicyConfig::StickyLeastLoaded,
             }
         };
 
