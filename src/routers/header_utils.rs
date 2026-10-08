@@ -3,6 +3,7 @@ use axum::extract::Request;
 use axum::http::HeaderMap;
 
 pub use crate::otel_http::TRACE_HEADER_NAMES;
+use crate::policies::RequestHeaders;
 
 /// Copy request headers to a Vec of name-value string pairs
 /// Used for forwarding headers to backend workers
@@ -17,6 +18,22 @@ pub fn copy_request_headers(req: &Request<Body>) -> Vec<(String, String)> {
                 .map(|v| (name.to_string(), v.to_string()))
         })
         .collect()
+}
+
+/// Convert an axum HeaderMap into the policy-facing `RequestHeaders` map
+/// (lowercased names, non-UTF8 values skipped), as expected by
+/// `LoadBalancingPolicy::select_worker_with_headers`.
+pub fn to_policy_headers(headers: Option<&HeaderMap>) -> Option<RequestHeaders> {
+    headers.map(|h| {
+        h.iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|v| (name.as_str().to_lowercase(), v.to_string()))
+            })
+            .collect()
+    })
 }
 
 /// Convert headers from reqwest Response to axum HeaderMap
@@ -92,4 +109,31 @@ pub fn propagate_headers(
         }
     }
     request
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_to_policy_headers() {
+        use axum::http::HeaderValue;
+
+        assert!(to_policy_headers(None).is_none());
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Session-ID", HeaderValue::from_static("abc"));
+        headers.insert(
+            "x-binary",
+            HeaderValue::from_bytes(&[0xff, 0xfe]).expect("opaque header value"),
+        );
+
+        let converted = to_policy_headers(Some(&headers)).unwrap();
+        assert_eq!(
+            converted.get("x-session-id").map(String::as_str),
+            Some("abc")
+        );
+        // Non-UTF8 values are skipped rather than failing the request.
+        assert!(!converted.contains_key("x-binary"));
+    }
 }

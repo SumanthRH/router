@@ -10,7 +10,7 @@ use crate::core::{
 };
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
-use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
+use crate::policies::{LoadBalancingPolicy, PolicyRegistry, RequestHeaders};
 use crate::protocols::spec::{
     ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, RerankRequest,
     ResponsesRequest, StringOrArray, UserMessageContent,
@@ -967,6 +967,10 @@ impl PDRouter {
         let start_time = Instant::now();
 
         let route = context.route;
+        // Session-aware policies (e.g. sticky_least_loaded, consistent_hash) key on
+        // headers such as X-Session-ID, so pass them through to worker selection.
+        let request_headers = header_utils::to_policy_headers(headers);
+        let request_headers = request_headers.as_ref();
         RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             // Operation per attempt
@@ -978,7 +982,11 @@ impl PDRouter {
                     async move {
                         // Select workers fresh for each attempt
                         let (prefill, decode) = match self
-                            .select_pd_pair(context.request_text.as_deref(), context.model_id)
+                            .select_pd_pair(
+                                context.request_text.as_deref(),
+                                request_headers,
+                                context.model_id,
+                            )
                             .await
                         {
                             Ok(pair) => pair,
@@ -1411,6 +1419,7 @@ impl PDRouter {
     async fn select_pd_pair(
         &self,
         request_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
         model_id: Option<&str>,
     ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
         // Get workers from registry - filter by model if provided
@@ -1445,6 +1454,7 @@ impl PDRouter {
             &prefill_workers,
             &*prefill_policy,
             request_text,
+            headers,
             "prefill",
         )?;
 
@@ -1452,6 +1462,7 @@ impl PDRouter {
             &decode_workers,
             &*decode_policy,
             request_text,
+            headers,
             "decode",
         )?;
 
@@ -1463,6 +1474,7 @@ impl PDRouter {
         workers: &[Arc<dyn Worker>],
         policy: &dyn LoadBalancingPolicy,
         request_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
         worker_type: &str,
     ) -> Result<Arc<dyn Worker>, String> {
         // Check if we have any workers
@@ -1489,7 +1501,7 @@ impl PDRouter {
 
         // Let policy select from available workers (no conversion needed now!)
         let selected_idx = policy
-            .select_worker(&available_workers, request_text)
+            .select_worker_with_headers(&available_workers, request_text, headers)
             .ok_or_else(|| {
                 format!(
                     "Policy {} failed to select a {} worker",
@@ -2003,7 +2015,7 @@ impl RouterTrait for PDRouter {
         // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
 
         // Select a random worker pair using the policy
-        let (prefill, decode) = match self.select_pd_pair(None, None).await {
+        let (prefill, decode) = match self.select_pd_pair(None, None, None).await {
             Ok(pair) => pair,
             Err(e) => {
                 return (
@@ -2764,7 +2776,7 @@ mod tests {
         router.worker_registry.register(Arc::from(healthy_worker));
         router.worker_registry.register(Arc::from(decode_worker));
 
-        let result = router.select_pd_pair(None, None).await;
+        let result = router.select_pd_pair(None, None, None).await;
 
         assert!(result.is_ok());
         let (prefill, _decode) = result.unwrap();
@@ -2778,10 +2790,108 @@ mod tests {
     async fn test_empty_worker_lists() {
         let router = create_test_pd_router();
 
-        let result = router.select_pd_pair(None, None).await;
+        let result = router.select_pd_pair(None, None, None).await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No prefill workers available"));
+    }
+
+    // ============= Session-aware PD Selection Tests =============
+
+    /// Router with two prefill and two decode workers, each role on its own
+    /// `sticky_least_loaded` policy (as `--prefill-policy`/`--decode-policy` set up).
+    fn create_sticky_pd_router() -> (
+        PDRouter,
+        Arc<crate::policies::StickyLeastLoadedPolicy>,
+        Arc<crate::policies::StickyLeastLoadedPolicy>,
+    ) {
+        let router = create_test_pd_router();
+        let prefill_policy = Arc::new(crate::policies::StickyLeastLoadedPolicy::new());
+        let decode_policy = Arc::new(crate::policies::StickyLeastLoadedPolicy::new());
+        router
+            .policy_registry
+            .set_prefill_policy(prefill_policy.clone());
+        router
+            .policy_registry
+            .set_decode_policy(decode_policy.clone());
+
+        for i in 0..2 {
+            let prefill = create_test_worker(
+                format!("http://prefill{}", i),
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                true,
+            );
+            let decode =
+                create_test_worker(format!("http://decode{}", i), WorkerType::Decode, true);
+            router.worker_registry.register(Arc::from(prefill));
+            router.worker_registry.register(Arc::from(decode));
+        }
+        (router, prefill_policy, decode_policy)
+    }
+
+    fn session_headers(session_id: &str) -> RequestHeaders {
+        RequestHeaders::from([("x-session-id".to_string(), session_id.to_string())])
+    }
+
+    #[tokio::test]
+    async fn test_select_pd_pair_sticky_least_loaded_uses_session_header() {
+        let (router, prefill_policy, decode_policy) = create_sticky_pd_router();
+
+        for session in 0..4 {
+            let headers = session_headers(&format!("session-{}", session));
+            let mut pairs = std::collections::HashSet::new();
+            for turn in 0..4 {
+                // The prompt changes every turn; only the header identifies the session.
+                let text = format!("session {} turn {}", session, turn);
+                let (prefill, decode) = router
+                    .select_pd_pair(Some(&text), Some(&headers), None)
+                    .await
+                    .unwrap();
+                pairs.insert((prefill.url().to_string(), decode.url().to_string()));
+            }
+            assert_eq!(pairs.len(), 1, "session-{} moved: {:?}", session, pairs);
+        }
+
+        // Each role tracks every session once and balances them across replicas.
+        for policy in [&prefill_policy, &decode_policy] {
+            assert_eq!(policy.active_session_count(), 4);
+        }
+        for i in 0..2 {
+            assert_eq!(
+                prefill_policy.active_count_for(&format!("http://prefill{}", i)),
+                2
+            );
+            assert_eq!(
+                decode_policy.active_count_for(&format!("http://decode{}", i)),
+                2
+            );
+        }
+
+        // finish_session releases the session on both the prefill and decode policy.
+        for session in 0..4 {
+            router
+                .policy_registry
+                .finish_session(&format!("session-{}", session));
+        }
+        assert_eq!(prefill_policy.active_session_count(), 0);
+        assert_eq!(decode_policy.active_session_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_select_pd_pair_without_session_header_is_stateless() {
+        let (router, prefill_policy, decode_policy) = create_sticky_pd_router();
+
+        // PD routes hand the policy the prompt text, not the JSON body, so
+        // without headers there is no session id to track.
+        router
+            .select_pd_pair(Some("hello"), None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(prefill_policy.active_session_count(), 0);
+        assert_eq!(decode_policy.active_session_count(), 0);
     }
 
     // ============= Health Endpoints Tests =============

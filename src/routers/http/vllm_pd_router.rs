@@ -9,7 +9,8 @@ use crate::config::KvConnector;
 use crate::core::{BasicWorker, Worker, WorkerType};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
-use crate::policies::PolicyRegistry;
+use crate::policies::{LoadBalancingPolicy, PolicyRegistry, RequestHeaders};
+use crate::routers::header_utils;
 use crate::routers::{RouterTrait, WorkerManagement};
 use async_trait::async_trait;
 use axum::{
@@ -358,6 +359,28 @@ impl VllmPDRouter {
         instances: &[(String, String)],
         is_prefill: bool,
         request_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<usize> {
+        // Get the appropriate policy
+        let policy = if is_prefill {
+            self.policy_registry.get_prefill_policy()
+        } else {
+            self.policy_registry.get_decode_policy()
+        };
+
+        Self::select_instance(&*policy, instances, request_text, headers)
+    }
+
+    /// Select one of the discovered `instances` with `policy`.
+    ///
+    /// Headers are forwarded so that session-aware policies (e.g. `consistent_hash`
+    /// keyed on `X-Session-ID`) behave the same in service-discovery mode as in
+    /// direct-URL mode.
+    fn select_instance(
+        policy: &dyn LoadBalancingPolicy,
+        instances: &[(String, String)],
+        request_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
     ) -> Option<usize> {
         if instances.is_empty() {
             return None;
@@ -366,15 +389,7 @@ impl VllmPDRouter {
         // Convert instances to workers for policy selection
         let workers = Self::instances_to_workers(instances);
 
-        // Get the appropriate policy
-        let policy = if is_prefill {
-            self.policy_registry.get_prefill_policy()
-        } else {
-            self.policy_registry.get_decode_policy()
-        };
-
-        // Use policy to select worker
-        policy.select_worker(&workers, request_text)
+        policy.select_worker_with_headers(&workers, request_text, headers)
     }
 
     /// Process vLLM request using pure service discovery
@@ -416,22 +431,31 @@ impl VllmPDRouter {
         // Use policy-based load balancing to select prefill and decode workers
         let request_text = serde_json::to_string(&request_json).ok();
         let request_str = request_text.as_deref();
+        let request_headers = header_utils::to_policy_headers(headers);
 
-        let prefill_idx =
-            match self.select_worker_with_policy(&prefill_instances, true, request_str) {
-                Some(idx) => idx,
-                None => {
-                    RouterMetrics::record_pd_error("server_selection");
-                    return (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "Prefill policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
-                }
-            };
+        let prefill_idx = match self.select_worker_with_policy(
+            &prefill_instances,
+            true,
+            request_str,
+            request_headers.as_ref(),
+        ) {
+            Some(idx) => idx,
+            None => {
+                RouterMetrics::record_pd_error("server_selection");
+                return (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "Prefill policy failed to select a worker".to_string(),
+                )
+                    .into_response();
+            }
+        };
 
-        let decode_idx = match self.select_worker_with_policy(&decode_instances, false, request_str)
-        {
+        let decode_idx = match self.select_worker_with_policy(
+            &decode_instances,
+            false,
+            request_str,
+            request_headers.as_ref(),
+        ) {
             Some(idx) => idx,
             None => {
                 RouterMetrics::record_pd_error("server_selection");
@@ -2211,5 +2235,114 @@ mod tests {
         let result = VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate");
         assert_eq!(result["stream"], false);
         assert!(result.get("stream_options").is_none());
+    }
+
+    // --- Service-discovery mode: worker selection forwards request headers ---
+
+    fn discovered_instances(prefix: &str, n: usize) -> Vec<(String, String)> {
+        (0..n)
+            .map(|i| {
+                (
+                    format!("{}-{}:8000", prefix, i),
+                    format!("tcp://{}-{}:5557", prefix, i),
+                )
+            })
+            .collect()
+    }
+
+    fn session_headers(session_id: &str) -> RequestHeaders {
+        RequestHeaders::from([("x-session-id".to_string(), session_id.to_string())])
+    }
+
+    /// Distinct indices picked for `bodies`, all sent with the same `headers`.
+    fn distinct_selections(
+        policy: &dyn LoadBalancingPolicy,
+        instances: &[(String, String)],
+        bodies: &[String],
+        headers: Option<&RequestHeaders>,
+    ) -> std::collections::HashSet<usize> {
+        bodies
+            .iter()
+            .map(|body| {
+                VllmPDRouter::select_instance(policy, instances, Some(body), headers)
+                    .expect("policy should select an instance")
+            })
+            .collect()
+    }
+
+    fn turn_bodies(n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| json!({"prompt": format!("turn {}", i)}).to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_select_instance_session_header_pins_hash_policies() {
+        use crate::policies::{ConsistentHashPolicy, RendezvousHashPolicy};
+
+        let instances = discovered_instances("prefill", 4);
+        let bodies = turn_bodies(20);
+        let headers = session_headers("session-a");
+        let policies: Vec<Box<dyn LoadBalancingPolicy>> = vec![
+            Box::new(ConsistentHashPolicy::new()),
+            Box::new(RendezvousHashPolicy::new()),
+        ];
+
+        for policy in &policies {
+            // Every turn of the session carries a different body but the same
+            // X-Session-ID, so it must land on the same instance.
+            let pinned = distinct_selections(&**policy, &instances, &bodies, Some(&headers));
+            assert_eq!(
+                pinned.len(),
+                1,
+                "{}: one session should map to one instance, got {:?}",
+                policy.name(),
+                pinned
+            );
+
+            // Without headers the policy falls back to hashing the body, so the
+            // same turns spread out: the header is what provides stickiness.
+            let unpinned = distinct_selections(&**policy, &instances, &bodies, None);
+            assert!(
+                unpinned.len() > 1,
+                "{}: body-hash fallback should not pin all turns, got {:?}",
+                policy.name(),
+                unpinned
+            );
+        }
+    }
+
+    #[test]
+    fn test_select_instance_pd_pair_is_sticky_per_session() {
+        use crate::policies::ConsistentHashPolicy;
+
+        // Separate policy instances for each role, as PolicyRegistry provides.
+        let prefill_policy = ConsistentHashPolicy::new();
+        let decode_policy = ConsistentHashPolicy::new();
+        let prefill = discovered_instances("prefill", 3);
+        let decode = discovered_instances("decode", 3);
+        let bodies = turn_bodies(10);
+
+        let mut pairs = std::collections::HashSet::new();
+        for session in 0..16 {
+            let headers = session_headers(&format!("session-{}", session));
+            let p = distinct_selections(&prefill_policy, &prefill, &bodies, Some(&headers));
+            let d = distinct_selections(&decode_policy, &decode, &bodies, Some(&headers));
+            assert_eq!(p.len(), 1, "session-{}: prefill not sticky", session);
+            assert_eq!(d.len(), 1, "session-{}: decode not sticky", session);
+            pairs.insert((*p.iter().next().unwrap(), *d.iter().next().unwrap()));
+        }
+        // Different sessions still spread across the pool.
+        assert!(pairs.len() > 1, "all sessions mapped to one P/D pair");
+    }
+
+    #[test]
+    fn test_select_instance_empty_instances() {
+        let policy = crate::policies::ConsistentHashPolicy::new();
+        let headers = session_headers("session-a");
+        assert_eq!(
+            VllmPDRouter::select_instance(&policy, &[], Some("{}"), Some(&headers)),
+            None
+        );
     }
 }
