@@ -2,6 +2,8 @@ use axum::body::Body;
 use axum::extract::Request;
 use axum::http::HeaderMap;
 
+use crate::policies::RequestHeaders;
+
 pub use crate::otel_http::TRACE_HEADER_NAMES;
 
 /// Copy request headers to a Vec of name-value string pairs
@@ -17,6 +19,22 @@ pub fn copy_request_headers(req: &Request<Body>) -> Vec<(String, String)> {
                 .map(|v| (name.to_string(), v.to_string()))
         })
         .collect()
+}
+
+/// Convert incoming request headers into the map consumed by
+/// `LoadBalancingPolicy::select_worker_with_headers`: names are lowercased and
+/// headers whose values are not valid UTF-8 are skipped.
+pub fn to_policy_headers(headers: Option<&HeaderMap>) -> Option<RequestHeaders> {
+    headers.map(|h| {
+        h.iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|v| (name.as_str().to_lowercase(), v.to_string()))
+            })
+            .collect()
+    })
 }
 
 /// Convert headers from reqwest Response to axum HeaderMap
@@ -126,5 +144,27 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         assert_eq!(result["content-type"], "application/json");
+    }
+
+    #[test]
+    fn test_to_policy_headers() {
+        use axum::http::HeaderValue;
+
+        assert!(to_policy_headers(None).is_none());
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Session-ID", HeaderValue::from_static("abc"));
+        headers.insert(
+            "x-binary",
+            HeaderValue::from_bytes(&[0xff, 0xfe]).expect("opaque header value"),
+        );
+
+        let converted = to_policy_headers(Some(&headers)).unwrap();
+        assert_eq!(
+            converted.get("x-session-id").map(String::as_str),
+            Some("abc")
+        );
+        // Non-UTF8 values are skipped rather than failing the request.
+        assert!(!converted.contains_key("x-binary"));
     }
 }
