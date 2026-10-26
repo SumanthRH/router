@@ -3086,6 +3086,62 @@ mod tests {
     }
 
     #[test]
+    fn test_select_instance_sticky_least_loaded_pd() {
+        use crate::policies::StickyLeastLoadedPolicy;
+
+        // Separate policy instances for each role, as PolicyRegistry provides.
+        let prefill_policy = StickyLeastLoadedPolicy::new();
+        let decode_policy = StickyLeastLoadedPolicy::new();
+        let prefill = discovered_instances("prefill", 2);
+        let decode = discovered_instances("decode", 2);
+        let bodies = turn_bodies(3);
+        let sessions: Vec<String> = (0..4).map(|i| format!("session-{}", i)).collect();
+
+        let mut prefill_of = HashMap::new();
+        for session in &sessions {
+            let headers = session_headers(session);
+            let p = distinct_selections(&prefill_policy, &prefill, &bodies, Some(&headers));
+            let d = distinct_selections(&decode_policy, &decode, &bodies, Some(&headers));
+            assert_eq!(p.len(), 1, "{}: prefill not sticky", session);
+            assert_eq!(d.len(), 1, "{}: decode not sticky", session);
+            prefill_of.insert(session.clone(), *p.iter().next().unwrap());
+        }
+
+        // New sessions go to the least-loaded instance: 2/2 on each role.
+        for (policy, role) in [(&prefill_policy, "prefill"), (&decode_policy, "decode")] {
+            assert_eq!(policy.active_session_count(), sessions.len());
+            for i in 0..2 {
+                let url = format!("http://{}-{}:8000", role, i);
+                assert_eq!(policy.active_count_for(&url), 2, "{}", url);
+            }
+        }
+
+        // A session whose instance drops out of discovery moves to a remaining
+        // instance on its next request.
+        let moved = sessions.iter().find(|s| prefill_of[*s] == 1).unwrap();
+        let headers = session_headers(moved);
+        assert_eq!(
+            VllmPDRouter::select_instance(
+                &prefill_policy,
+                &prefill[..1],
+                Some("{}"),
+                Some(&headers)
+            ),
+            Some(0)
+        );
+        assert_eq!(prefill_policy.active_count_for("http://prefill-0:8000"), 3);
+        assert_eq!(prefill_policy.active_count_for("http://prefill-1:8000"), 1);
+
+        // finish_session releases every session on both roles.
+        for session in &sessions {
+            prefill_policy.finish_session(session);
+            decode_policy.finish_session(session);
+        }
+        assert_eq!(prefill_policy.active_session_count(), 0);
+        assert_eq!(decode_policy.active_session_count(), 0);
+    }
+
+    #[test]
     fn test_select_instance_empty_instances() {
         let policy = crate::policies::ConsistentHashPolicy::new();
         let headers = session_headers("session-a");
