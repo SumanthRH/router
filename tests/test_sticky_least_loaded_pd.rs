@@ -75,6 +75,7 @@ mod sticky_least_loaded_pd_tests {
             profile_timeout_secs: 30,
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
             program_scheduling: None,
+            epd: None,
         }
     }
 
