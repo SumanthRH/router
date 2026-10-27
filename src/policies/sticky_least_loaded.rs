@@ -445,6 +445,23 @@ mod tests {
     }
 
     #[test]
+    fn test_finish_session_releases_escaped_body_id() {
+        let policy = StickyLeastLoadedPolicy::new();
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        let body = serde_json::json!({"user": "a\"b", "prompt": "hi"}).to_string();
+
+        policy
+            .select_worker_with_headers(&workers, Some(&body), None)
+            .unwrap();
+        assert_eq!(policy.active_session_count(), 1);
+
+        // The client finishes the session with the id it sent, not its JSON
+        // encoding.
+        policy.finish_session("a\"b");
+        assert_eq!(policy.active_session_count(), 0);
+    }
+
+    #[test]
     fn test_stateless_requests_not_tracked() {
         let policy = StickyLeastLoadedPolicy::new();
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
