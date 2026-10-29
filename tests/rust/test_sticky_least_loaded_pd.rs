@@ -26,9 +26,7 @@ mod sticky_least_loaded_pd_tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use tower::ServiceExt;
-    use vllm_router_rs::config::{
-        CircuitBreakerConfig, ConnectionMode, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
-    };
+    use vllm_router_rs::config::{PolicyConfig, RouterConfig, RoutingMode};
     use vllm_router_rs::policies::{LoadBalancingPolicy, StickyLeastLoadedPolicy};
     use vllm_router_rs::routers::RouterFactory;
     use vllm_router_rs::server::AppContext;
@@ -46,40 +44,14 @@ mod sticky_least_loaded_pd_tests {
                 discovery_address: None,
             },
             policy: PolicyConfig::StickyLeastLoaded,
-            host: "127.0.0.1".to_string(),
             port: 0,
-            max_payload_size: 256 * 1024 * 1024,
             request_timeout_secs: 10,
             worker_startup_timeout_secs: 5,
             worker_startup_check_interval_secs: 1,
-            intra_node_data_parallel_size: 1,
-            api_key: None,
-            api_key_validation_urls: vec![],
-            discovery: None,
-            metrics: None,
-            log_dir: None,
-            log_level: None,
-            request_id_headers: None,
             max_concurrent_requests: 64,
             queue_size: 0,
-            queue_timeout_secs: 60,
-            rate_limit_tokens_per_second: None,
-            cors_allowed_origins: vec![],
-            retry: RetryConfig::default(),
-            circuit_breaker: CircuitBreakerConfig::default(),
-            disable_retries: false,
-            disable_circuit_breaker: false,
-            health_check: vllm_router_rs::config::HealthCheckConfig::default(),
-            enable_igw: false,
-            connection_mode: ConnectionMode::Http,
-            history_backend: vllm_router_rs::config::HistoryBackend::Memory,
-            enable_profiling: false,
             profile_timeout_secs: 30,
-            kv_connector: vllm_router_rs::config::KvConnector::Nixl,
-            program_scheduling: None,
-            epd: None,
-            pd_kv_event_sources: Default::default(),
-            kv_aware_session_affinity_ttl_secs: None,
+            ..RouterConfig::default()
         }
     }
 
